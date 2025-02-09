@@ -1,4 +1,4 @@
-//! # ASTrie
+//! # ASTrie (Adaptive Segmented Trie)
 //!
 //! `astrie` is a high-performance hybrid data structure that combines the benefits of tries and B+ trees
 //! to provide efficient key-value storage with adaptive behavior based on data patterns.

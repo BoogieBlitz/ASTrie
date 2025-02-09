@@ -2,5 +2,13 @@
 name = "astrie"
 version = "0.1.0"
 edition = "2021"
+authors = ["BoogieBlitz", "Tapas Das <dlaststark@gmail.com>"]
+description = "High-performance hybrid data structure that combines the benefits of tries and B+ trees to provide efficient key-value storage with adaptive behavior based on data patterns."
+documentation = "https://docs.rs/astrie"
+readme = "README.md"
+repository = "https://github.com/BoogieBlitz/ASTrie"
+license = "Apache-2.0"
+keywords = ["data structures", "adaptive", "segmented", "trie"]
+categories = ["data-structures"]
 
 [dependencies]
