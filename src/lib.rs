@@ -563,6 +563,442 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
 mod tests {
     use super::*;
 
+    // Utility function to create a test trie node
+    fn create_test_trie_node<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
+        value: Option<V>,
+        depth: usize
+    ) -> TrieNode<K, V> {
+        TrieNode {
+            children: vec![None; 256],
+            value,
+            depth,
+            size: AtomicUsize::new(0),
+        }
+    }
+
+    // Utility function to create a test B+ tree node
+    fn create_test_btree_node<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
+        keys: Vec<K>,
+        values: Vec<V>,
+        is_leaf: bool
+    ) -> BTreeNode<K, V> {
+        BTreeNode {
+            keys,
+            values,
+            children: Vec::new(),
+            is_leaf,
+        }
+    }
+
+    #[test]
+    fn test_collect_trie_range() {
+        let mut result: Vec<(String, i32)> = Vec::new();
+        let mut node: TrieNode<String, i32> = create_test_trie_node::<String, i32>(Some(1), 0);
+        
+        // Create a simple trie structure
+        let child: TrieNode<String, i32> = create_test_trie_node(Some(2), 1);
+        node.children[97] = Some(Arc::new(RwLock::new(NodeType::Trie(child)))); // 'a'
+
+        utils::collect_trie_range(
+            &node,
+            Vec::new(),
+            &"a".to_string(),
+            &"c".to_string(),
+            &mut result
+        );
+
+        assert_eq!(result.len(), 1);
+        assert!(result.iter().any(|(k, v)| k == "a" && *v == 2));
+    }
+
+    #[test]
+    fn test_collect_btree_range() {
+        let mut result: Vec<(i32, String)> = Vec::new();
+        let node: BTreeNode<i32, String> = create_test_btree_node(
+            vec![1, 3, 5],
+            vec!["one".to_string(), "three".to_string(), "five".to_string()],
+            true
+        );
+
+        utils::collect_btree_range(&node, &1, &4, &mut result);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], (1, "one".to_string()));
+        assert_eq!(result[1], (3, "three".to_string()));
+    }
+
+    #[test]
+    fn test_insert_into_trie() {
+        let mut root: TrieNode<String, i32> = create_test_trie_node::<String, i32>(None, 0);
+        let key: String = "test".to_string();
+        let value: i32 = 42;
+        let key_bytes: &[u8] = key.as_bytes();
+
+        utils::insert_into_trie(&mut root, &key, value, 0, key_bytes);
+
+        // Verify the insertion
+        fn verify_path(
+            node: &Option<Arc<RwLock<NodeType<String, i32>>>>,
+            remaining_bytes: &[u8],
+            expected_value: i32
+        ) -> bool {
+            match node {
+                None => false,
+                Some(child) => {
+                    if let Ok(guard) = child.read() {
+                        match &*guard {
+                            NodeType::Trie(trie_node) => {
+                                if remaining_bytes.is_empty() {
+                                    return trie_node.value == Some(expected_value);
+                                }
+                                let next_byte = remaining_bytes[0] as usize;
+                                verify_path(
+                                    &trie_node.children[next_byte],
+                                    &remaining_bytes[1..],
+                                    expected_value
+                                )
+                            },
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                }
+            }
+        }
+
+        // Start verification from root's children
+        let first_byte = key_bytes[0] as usize;
+        assert!(verify_path(&root.children[first_byte], &key_bytes[1..], value));
+    }
+
+    #[test]
+    fn test_collect_leaf_pairs() {
+        let mut pairs: Vec<(i32, String)> = Vec::new();
+        let leaf1: BTreeNode<i32, String> = create_test_btree_node(
+            vec![1, 2],
+            vec!["one".to_string(), "two".to_string()],
+            true
+        );
+        let leaf2: BTreeNode<i32, String> = create_test_btree_node(
+            vec![3, 4],
+            vec!["three".to_string(), "four".to_string()],
+            true
+        );
+
+        let mut parent: BTreeNode<i32, String> = create_test_btree_node(vec![3], vec!["three".to_string()], false);
+        parent.children = vec![
+            Arc::new(RwLock::new(NodeType::BTree(leaf1))),
+            Arc::new(RwLock::new(NodeType::BTree(leaf2))),
+        ];
+
+        utils::collect_leaf_pairs(&parent, &mut pairs);
+
+        assert_eq!(pairs.len(), 4);
+        assert_eq!(pairs[0], (1, "one".to_string()));
+        assert_eq!(pairs[3], (4, "four".to_string()));
+    }
+
+    #[test]
+    fn test_handle_split() {
+        // Create a parent node with initial children
+        let mut parent = BTreeNode {
+            keys: vec![1, 5],
+            values: vec!["one".to_string(), "five".to_string()],
+            children: vec![
+                Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
+                    keys: vec![0],
+                    values: vec!["zero".to_string()],
+                    children: Vec::new(),
+                    is_leaf: true,
+                }))),
+                Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
+                    keys: vec![2],
+                    values: vec!["two".to_string()],
+                    children: Vec::new(),
+                    is_leaf: true,
+                }))),
+                Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
+                    keys: vec![6],
+                    values: vec!["six".to_string()],
+                    children: Vec::new(),
+                    is_leaf: true,
+                }))),
+            ],
+            is_leaf: false,
+        };
+
+        // Create the right node that results from a split
+        let right_node = Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
+            keys: vec![4],
+            values: vec!["four".to_string()],
+            children: Vec::new(),
+            is_leaf: true,
+        })));
+
+        // Create split info
+        let split_info = SplitInfo {
+            median_key: 3,
+            median_value: "three".to_string(),
+            right_node: right_node.clone(),
+        };
+
+        // Handle the split at index 1 (between 1 and 5)
+        utils::handle_split(&mut parent, 1, split_info);
+
+        // Verify the result
+        assert_eq!(parent.keys, vec![1, 3, 5], "Keys should be [1, 3, 5]");
+        assert_eq!(
+            parent.values,
+            vec!["one".to_string(), "three".to_string(), "five".to_string()],
+            "Values should be [one, three, five]"
+        );
+        assert_eq!(parent.children.len(), 4, "Should have 4 children after split");
+
+        // Helper function to safely verify a child node
+        fn verify_child_node(child: &Arc<RwLock<NodeType<i32, String>>>, expected_keys: Vec<i32>, expected_values: Vec<String>) -> bool {
+            if let Ok(guard) = child.read() {
+                match &*guard {
+                    NodeType::BTree(node) => {
+                        node.keys == expected_keys && node.values == expected_values
+                    },
+                    _ => false
+                }
+            } else {
+                false
+            }
+        }
+
+        // Verify children order
+        assert!(verify_child_node(&parent.children[0], vec![0], vec!["zero".to_string()]), 
+            "First child should have key [0]");
+        assert!(verify_child_node(&parent.children[1], vec![2], vec!["two".to_string()]), 
+            "Second child should have key [2]");
+        assert!(verify_child_node(&parent.children[2], vec![4], vec!["four".to_string()]), 
+            "Third child should have key [4]");
+        assert!(verify_child_node(&parent.children[3], vec![6], vec!["six".to_string()]), 
+            "Fourth child should have key [6]");
+    }
+
+    #[test]
+    fn test_split_btree_node() {
+        // Test leaf node split
+        let mut leaf: BTreeNode<i32, String> = BTreeNode {
+            keys: vec![1, 2, 3, 4, 5],
+            values: vec![
+                "1".to_string(),
+                "2".to_string(),
+                "3".to_string(),
+                "4".to_string(),
+                "5".to_string()
+            ],
+            children: Vec::new(),
+            is_leaf: true,
+        };
+
+        let split_info: Option<SplitInfo<i32, String>> = utils::split_btree_node(&mut leaf);
+        assert!(split_info.is_some());
+        let info: SplitInfo<i32, String> = split_info.unwrap();
+
+        // For a leaf node:
+        // - Left node (original) should have [1, 2]
+        // - Right node should have [3, 4, 5]
+        // - Median key should be 3 (first key of right node)
+        assert_eq!(leaf.keys, vec![1, 2]);
+        assert_eq!(leaf.values, vec!["1".to_string(), "2".to_string()]);
+
+        // Verify the right node
+        if let Ok(guard) = info.right_node.read() {
+            match &*guard {
+                NodeType::BTree(right) => {
+                    assert_eq!(right.keys, vec![3, 4, 5]);
+                    assert_eq!(right.values, vec![
+                        "3".to_string(),
+                        "4".to_string(),
+                        "5".to_string()
+                    ]);
+                    assert!(right.is_leaf);
+                },
+                _ => panic!("Expected BTree node"),
+            }
+        }
+        assert_eq!(info.median_key, 3);
+        assert_eq!(info.median_value, "3".to_string());
+
+        // Test internal node split
+        let mut internal: BTreeNode<i32, String> = BTreeNode {
+            keys: vec![10, 20, 30, 40],
+            values: vec![
+                "10".to_string(),
+                "20".to_string(),
+                "30".to_string(),
+                "40".to_string()
+            ],
+            children: vec![
+                Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
+                    keys: vec![5],
+                    values: vec!["5".to_string()],
+                    children: Vec::new(),
+                    is_leaf: true,
+                }))),
+                Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
+                    keys: vec![15],
+                    values: vec!["15".to_string()],
+                    children: Vec::new(),
+                    is_leaf: true,
+                }))),
+                Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
+                    keys: vec![25],
+                    values: vec!["25".to_string()],
+                    children: Vec::new(),
+                    is_leaf: true,
+                }))),
+                Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
+                    keys: vec![35],
+                    values: vec!["35".to_string()],
+                    children: Vec::new(),
+                    is_leaf: true,
+                }))),
+                Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
+                    keys: vec![45],
+                    values: vec!["45".to_string()],
+                    children: Vec::new(),
+                    is_leaf: true,
+                }))),
+            ],
+            is_leaf: false,
+        };
+
+        let split_info: Option<SplitInfo<i32, String>> = utils::split_btree_node(&mut internal);
+        assert!(split_info.is_some());
+        let info: SplitInfo<i32, String> = split_info.unwrap();
+
+        // For an internal node:
+        // - Left node should have [10, 20]
+        // - Right node should have [30, 40]
+        // - Median key (20) moves up
+        assert_eq!(internal.keys, vec![10, 20]);
+        assert_eq!(internal.values, vec!["10".to_string(), "20".to_string()]);
+        assert_eq!(internal.children.len(), 3);
+
+        if let Ok(guard) = info.right_node.read() {
+            match &*guard {
+                NodeType::BTree(right) => {
+                    assert_eq!(right.keys, vec![40]);
+                    assert_eq!(right.values, vec!["40".to_string()]);
+                    assert_eq!(right.children.len(), 2);
+                    assert!(!right.is_leaf);
+                },
+                _ => panic!("Expected BTree node"),
+            }
+        }
+        assert_eq!(info.median_key, 30);
+        assert_eq!(info.median_value, "30".to_string());
+    }
+
+    #[test]
+    fn test_collect_pairs() {
+        let mut pairs: Vec<(String, i32)> = Vec::new();
+        let mut node: TrieNode<String, i32> = create_test_trie_node::<String, i32>(Some(1), 0);
+        
+        // Add some children
+        let child1: TrieNode<String, i32> = create_test_trie_node(Some(2), 1);
+        let child2: TrieNode<String, i32> = create_test_trie_node(Some(3), 1);
+        
+        node.children[97] = Some(Arc::new(RwLock::new(NodeType::Trie(child1)))); // 'a'
+        node.children[98] = Some(Arc::new(RwLock::new(NodeType::Trie(child2)))); // 'b'
+
+        utils::collect_pairs(&node, Vec::new(), &mut pairs);
+
+        assert_eq!(pairs.len(), 3);
+    }
+
+    #[test]
+    fn test_convert_to_trie() {
+        let btree: BTreeNode<String, i32> = create_test_btree_node(
+            vec!["a".to_string(), "b".to_string()],
+            vec![1, 2],
+            true
+        );
+
+        let result: NodeType<String, i32> = utils::convert_to_trie(&btree);
+        
+        match result {
+            NodeType::Trie(trie) => {
+                // Verify first key-value pair
+                let key_bytes: &[u8] = "a".as_bytes();
+                
+                fn verify_trie_path(
+                    children: &[Option<Arc<RwLock<NodeType<String, i32>>>>],
+                    bytes: &[u8],
+                    expected_value: i32
+                ) -> bool {
+                    if bytes.is_empty() {
+                        return false;
+                    }
+
+                    let byte: usize = bytes[0] as usize;
+                    if let Some(ref child) = children[byte] {
+                        if let Ok(guard) = child.read() {
+                            match &*guard {
+                                NodeType::Trie(trie_node) => {
+                                    if bytes.len() == 1 {
+                                        trie_node.value == Some(expected_value)
+                                    } else {
+                                        verify_trie_path(&trie_node.children, &bytes[1..], expected_value)
+                                    }
+                                },
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
+
+                assert!(verify_trie_path(&trie.children, key_bytes, 1));
+            },
+            _ => panic!("Expected Trie node"),
+        }
+    }
+
+    #[test]
+    fn test_convert_to_btree() {
+        // Explicitly specify type parameters
+        let mut trie: TrieNode<String, i32> = create_test_trie_node(Some(1), 0);
+        
+        // Add some children
+        let child: TrieNode<String, i32> = create_test_trie_node(Some(2), 1);
+        trie.children[97] = Some(Arc::new(RwLock::new(NodeType::Trie(child))));
+
+        let result: NodeType<String, i32> = utils::convert_to_btree(&trie);
+        
+        match result {
+            NodeType::BTree(btree) => {
+                assert!(btree.is_leaf);
+                assert_eq!(btree.keys.len(), 2);
+                assert_eq!(btree.values.len(), 2);
+            },
+            _ => panic!("Expected BTree node"),
+        }
+    }
+
+    #[test]
+    fn test_btree_node_operations() {
+        // Test with explicit types for B+ tree nodes
+        let btree: BTreeNode<String, i32> = create_test_btree_node(
+            vec!["a".to_string(), "b".to_string()],
+            vec![1, 2],
+            true
+        );
+
+        assert_eq!(btree.keys.len(), 2);
+        assert_eq!(btree.values.len(), 2);
+        assert!(btree.is_leaf);
+    }
+
     #[test]
     fn test_string_key_conversion() {
         let key = String::from("hello");

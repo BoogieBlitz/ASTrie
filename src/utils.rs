@@ -201,7 +201,7 @@ pub(crate) fn handle_split<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
 pub(crate) fn split_btree_node<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     node: &mut BTreeNode<K, V>,
 ) -> Option<SplitInfo<K, V>> {
-    let mid: usize = BTREE_MAX_KEYS / 2;
+    let mid: usize = node.keys.len() / 2;
 
     // Create a new right node
     let mut right_node: BTreeNode<K, V> = BTreeNode {
@@ -222,7 +222,7 @@ pub(crate) fn split_btree_node<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
         let median_value: V = right_node.values[0].clone();
 
         // Wrap the right node
-        let right_node = Arc::new(RwLock::new(NodeType::BTree(right_node)));
+        let right_node: Arc<RwLock<NodeType<K, V>>> = Arc::new(RwLock::new(NodeType::BTree(right_node)));
 
         Some(SplitInfo {
             median_key,
