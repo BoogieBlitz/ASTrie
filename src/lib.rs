@@ -1,44 +1,219 @@
+//! # ASTrie
+//!
+//! `astrie` is a high-performance hybrid data structure that combines the benefits of tries and B+ trees
+//! to provide efficient key-value storage with adaptive behavior based on data patterns.
+//!
+//! ## Features
+//!
+//! - **Hybrid Structure**: Dynamically switches between trie and B+ tree nodes based on data characteristics
+//! - **Efficient Operations**: O(k) or O(log n) lookups, where k is key length
+//! - **Range Queries**: Fast range scans with ordered iteration
+//! - **Thread-Safe**: Concurrent access support using fine-grained locking
+//! - **Memory Efficient**: Adaptive storage strategy to minimize memory usage
+//! - **Generic**: Supports any key type that implements required traits
+//!
+//! ## Usage
+//!
+//! Add this to your `Cargo.toml`:
+//!
+//! ```toml
+//! [dependencies]
+//! astrie = "0.1.0"
+//! ```
+//!
+//! ## Example
+//!
+//! ```rust
+//! use astrie::ASTrie;
+//!
+//! // Create a new ASTrie with string keys and integer values
+//! let trie = ASTrie::<String, i32>::new();
+//!
+//! // Insert some data
+//! trie.insert("hello".to_string(), 1);
+//! trie.insert("world".to_string(), 2);
+//!
+//! // Lookup
+//! assert_eq!(trie.get(&"hello".to_string()), Some(1));
+//!
+//! // Range query
+//! let range = trie.range(&"h".to_string(), &"w".to_string());
+//! assert_eq!(range.len(), 2);
+//! ```
+//!
+//! ## Custom Types
+//!
+//! To use custom types as keys, implement the required traits:
+//!
+//! ```rust
+//! use astrie::{ToBytes, FromBytes};
+//!
+//! #[derive(Clone, Ord, PartialOrd, Eq, PartialEq)]
+//! struct CustomKey {
+//!     id: u32,
+//!     name: String,
+//! }
+//!
+//! impl ToBytes for CustomKey {
+//!     fn to_bytes(&self) -> Vec<u8> {
+//!         let mut bytes = Vec::new();
+//!         bytes.extend_from_slice(&self.id.to_be_bytes());
+//!         bytes.extend_from_slice(self.name.as_bytes());
+//!         bytes
+//!     }
+//! }
+//!
+//! impl FromBytes for CustomKey {
+//!     fn from_bytes(bytes: &[u8]) -> Option<Self> {
+//!         if bytes.len() < 4 {
+//!             return None;
+//!         }
+//!         let id = u32::from_be_bytes(bytes[0..4].try_into().ok()?);
+//!         let name = String::from_utf8(bytes[4..].to_vec()).ok()?;
+//!         Some(CustomKey { id, name })
+//!     }
+//! }
+//! ```
+//!
+//! ## Performance
+//!
+//! The ASTrie structure adapts to your data patterns:
+//!
+//! - For sparse key spaces: Uses trie nodes for O(k) lookups
+//! - For dense key ranges: Uses B+ tree nodes for O(log n) lookups
+//! - For range queries: O(log n + m) where m is the size of the range
+//!
+//! ## Thread Safety
+//!
+//! ASTrie uses fine-grained locking for concurrent access:
+//!
+//! ```rust
+//! use std::thread;
+//! use std::sync::Arc;
+//!
+//! let trie = Arc::new(ASTrie::<String, i32>::new());
+//! let mut handles = vec![];
+//!
+//! for i in 0..10 {
+//!     let trie_clone = trie.clone();
+//!     let handle = thread::spawn(move || {
+//!         trie_clone.insert(format!("key-{}", i), i);
+//!     });
+//!     handles.push(handle);
+//! }
+//!
+//! for handle in handles {
+//!     handle.join().unwrap();
+//! }
+//! ```
+//!
+//! ## Configuration
+//!
+//! Key constants that can be tuned:
+//!
+//! ```rust
+//! const TRIE_DEPTH_THRESHOLD: usize = 8;    // Max trie depth before conversion
+//! const BTREE_MIN_OCCUPANCY: f32 = 0.4;     // Min B+ tree node occupancy
+//! const NODE_SIZE: usize = 256;             // Node size for cache alignment
+//! ```
+//!
+//! ## Use Cases
+//!
+//! ASTrie is particularly well-suited for:
+//!
+//! - Key-value stores with range query requirements
+//! - Network routing tables (IP prefix matching)
+//! - Auto-complete systems
+//! - Time-series databases
+//! - In-memory caches
+//!
+//! ## Error Handling
+//!
+//! Operations that might fail return `Option` or `Result`:
+//!
+//! ```rust
+//! let trie = ASTrie::<String, i32>::new();
+//!
+//! // Get returns Option
+//! match trie.get(&"key".to_string()) {
+//!     Some(value) => println!("Found: {}", value),
+//!     None => println!("Key not found"),
+//! }
+//!
+//! // Range queries return empty Vec if no matches
+//! let empty_range = trie.range(&"z".to_string(), &"zzz".to_string());
+//! assert!(empty_range.is_empty());
+//! ```
+//!
+//! ## Implementation Details
+//!
+//! The adaptive behavior is controlled by two main mechanisms:
+//!
+//! 1. **Depth-based Conversion**: Trie nodes beyond `TRIE_DEPTH_THRESHOLD` are converted to B+ tree nodes
+//! 2. **Occupancy-based Conversion**: B+ tree nodes below `BTREE_MIN_OCCUPANCY` are converted to tries
+//!
+//! ## License
+//!
+//! This project is licensed under the Apache 2.0 License - see the LICENSE file for details.
+//!
+//! ## Contributing
+//!
+//! Contributions are welcome! Please feel free to submit a Pull Request.
+
+mod utils;
+
 use std::convert::TryInto;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // Configuration constants
-const TRIE_DEPTH_THRESHOLD: usize = 8; // Max trie depth before converting to B+ tree
-const BTREE_MIN_OCCUPANCY: f32 = 0.4; // Minimum occupancy before collapsing to trie
-const NODE_SIZE: usize = 256; // Size aligned with common CPU cache lines
-const BTREE_MAX_KEYS: usize = NODE_SIZE / 2; // Maximum number of keys in a B+ tree node
 
-// Trait for converting keys to bytes
+/// Max trie depth before converting to B+ tree
+const TRIE_DEPTH_THRESHOLD: usize = 8;
+
+/// Minimum occupancy before collapsing to trie
+const BTREE_MIN_OCCUPANCY: f32 = 0.4;
+
+/// Size aligned with common CPU cache lines
+const NODE_SIZE: usize = 256;
+
+/// Maximum number of keys in a B+ tree node
+const BTREE_MAX_KEYS: usize = NODE_SIZE / 2;
+
+/// Key trait for converting types to byte representation
 pub trait ToBytes {
     fn to_bytes(&self) -> Vec<u8>;
 }
 
-// Implement ToBytes for common types
+// Implement ToBytes for String type
 impl ToBytes for String {
     fn to_bytes(&self) -> Vec<u8> {
         self.as_bytes().to_vec()
     }
 }
 
+// Implement ToBytes for string slice
 impl ToBytes for str {
     fn to_bytes(&self) -> Vec<u8> {
         self.as_bytes().to_vec()
     }
 }
 
+// Implement ToBytes for sequence of integers
 impl ToBytes for [u8] {
     fn to_bytes(&self) -> Vec<u8> {
         self.to_vec()
     }
 }
 
+// Implement ToBytes for Vector of integers
 impl ToBytes for Vec<u8> {
     fn to_bytes(&self) -> Vec<u8> {
         self.clone()
     }
 }
 
-// Implement for integer types
+// Macro implementation for integer types
 macro_rules! impl_to_bytes_for_int {
     ($($t:ty),*) => {
         $(
@@ -53,25 +228,26 @@ macro_rules! impl_to_bytes_for_int {
 
 impl_to_bytes_for_int!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
 
-// Trait for converting back from bytes
+/// Key trait for reconstructing types from bytes
 pub trait FromBytes: Sized {
     fn from_bytes(bytes: &[u8]) -> Option<Self>;
 }
 
-// Implement FromBytes for common types
+// Implement FromBytes for String type
 impl FromBytes for String {
     fn from_bytes(bytes: &[u8]) -> Option<Self> {
         String::from_utf8(bytes.to_vec()).ok()
     }
 }
 
+// Implement FromBytes for Vector of integers
 impl FromBytes for Vec<u8> {
     fn from_bytes(bytes: &[u8]) -> Option<Self> {
         Some(bytes.to_vec())
     }
 }
 
-// Implement FromBytes for integer types
+// Macro implementation for integer types
 macro_rules! impl_from_bytes_for_int {
     ($($t:ty),*) => {
         $(
@@ -91,19 +267,20 @@ macro_rules! impl_from_bytes_for_int {
 
 impl_from_bytes_for_int!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
 
-// Main enum to represent either a trie or B+ tree node
+/// Main enum to represent either a trie or B+ tree node
 enum NodeType<K: Clone + Ord, V> {
     Trie(TrieNode<K, V>),
     BTree(BTreeNode<K, V>),
 }
 
+/// Contains information about a B+ tree node split: the median key-value pair and the new right node
 struct SplitInfo<K: Clone + Ord + ToBytes, V: Clone> {
     median_key: K,
     median_value: V,
     right_node: Arc<RwLock<NodeType<K, V>>>,
 }
 
-// Trie node implementation
+/// Trie node implementation
 struct TrieNode<K: Clone + Ord, V> {
     children: Vec<Option<Arc<RwLock<NodeType<K, V>>>>>,
     value: Option<V>,
@@ -111,7 +288,7 @@ struct TrieNode<K: Clone + Ord, V> {
     size: AtomicUsize,
 }
 
-// B+ tree node implementation
+/// B+ tree node implementation
 struct BTreeNode<K: Clone + Ord, V> {
     keys: Vec<K>,
     values: Vec<V>,
@@ -119,13 +296,14 @@ struct BTreeNode<K: Clone + Ord, V> {
     is_leaf: bool,
 }
 
-// Main ASTrie structure
+/// Main ASTrie data structure
 pub struct ASTrie<K: Clone + Ord, V> {
     root: Arc<RwLock<NodeType<K, V>>>,
     size: AtomicUsize,
 }
 
 impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
+    /// Creates a new empty ASTrie with default configuration
     pub fn new() -> Self {
         ASTrie {
             root: Arc::new(RwLock::new(NodeType::Trie(TrieNode {
@@ -138,6 +316,100 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
         }
     }
 
+    /// Retrieves the value associated with the given key, or None if the key doesn't exist
+    pub fn get(&self, key: &K) -> Option<V> {
+        // Convert the key to its byte representation for trie traversal
+        let key_bytes: Vec<u8> = key.to_bytes();
+
+        // Start at the root node, wrapped in Arc for thread-safe reference counting
+        let mut current: Arc<RwLock<NodeType<K, V>>> = self.root.clone();
+
+        // Continue traversing nodes until we find the key or determine it doesn't exist
+        loop {
+            // Create a new scope for the read lock to ensure it's released after node processing
+            let next_node: Option<Arc<RwLock<NodeType<K, V>>>> = {
+                // Acquire a read lock on the current node
+                let node: RwLockReadGuard<'_, NodeType<K, V>> = current.read().unwrap();
+
+                match &*node {
+                    // If we're at a trie node
+                    NodeType::Trie(trie_node) => {
+                        // Check if we've consumed all bytes of the key
+                        // If so, return the value at this node (if any)
+                        if trie_node.depth == key_bytes.len() {
+                            return trie_node.value.clone();
+                        }
+
+                        // Get the next byte from the key to determine which child to traverse
+                        let current_byte: usize = key_bytes[trie_node.depth] as usize;
+
+                        // Try to get the child node at the current byte's index
+                        // If child exists, prepare to traverse to it
+                        // If no child exists, the key doesn't exist in the trie
+                        match &trie_node.children[current_byte] {
+                            Some(child) => Some(child.clone()),
+                            None => None,
+                        }
+                    }
+
+                    // If we're at a B+ tree node
+                    NodeType::BTree(btree_node) => {
+                        // If this is a leaf node
+                        if btree_node.is_leaf {
+                            // Binary search in leaf node
+                            match btree_node.keys.binary_search(key) {
+                                Ok(idx) => return Some(btree_node.values[idx].clone()),
+                                Err(_) => return None,
+                            }
+                        } else {
+                            // Navigate internal node
+                            // If key exists, go to the right child
+                            // If key doesn't exist, go to the child where it would be
+                            let child_idx: usize = match btree_node.keys.binary_search(key) {
+                                Ok(idx) => idx + 1,
+                                Err(idx) => idx,
+                            };
+
+                            // Return the child node to traverse
+                            Some(btree_node.children[child_idx].clone())
+                        }
+                    }
+                }
+            }; // read lock is dropped here
+
+            // Process the result of node traversal
+            // If we have a next node to traverse, update current and continue
+            // If we hit a dead end, the key doesn't exist
+            match next_node {
+                Some(next) => current = next,
+                None => return None,
+            }
+        }
+    }
+
+    /// Returns all key-value pairs where the key is within the given range [start, end], inclusive
+    pub fn range(&self, start: &K, end: &K) -> Vec<(K, V)> {
+        let mut result: Vec<(K, V)> = Vec::new();
+        if start > end {
+            return result;
+        }
+
+        // Start traversal from root
+        let root: RwLockReadGuard<'_, NodeType<K, V>> = self.root.read().unwrap();
+        match &*root {
+            NodeType::Trie(trie_node) => {
+                utils::collect_trie_range(trie_node, Vec::new(), start, end, &mut result);
+            }
+            NodeType::BTree(btree_node) => {
+                utils::collect_btree_range(btree_node, start, end, &mut result);
+            }
+        }
+
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+
+    /// Inserts a key-value pair into the ASTrie, returning the previous value if it existed
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let mut current: Arc<RwLock<NodeType<K, V>>> = self.root.clone();
         let mut old_value: Option<V> = None;
@@ -152,13 +424,13 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
                     NodeType::Trie(trie_node) => {
                         if trie_node.depth >= TRIE_DEPTH_THRESHOLD {
                             // Convert to B+ tree if depth threshold reached
-                            let new_btree: NodeType<K, V> = self.convert_to_btree(trie_node);
+                            let new_btree: NodeType<K, V> = utils::convert_to_btree(trie_node);
                             *node = new_btree;
                             continue; // Retry insertion with new B+ tree node
                         }
 
                         // Get bytes from key for trie traversal
-                        let key_bytes: Vec<u8> = self.key_to_bytes(&key);
+                        let key_bytes: Vec<u8> = utils::key_to_bytes(&key);
                         let current_byte: u8 = key_bytes.get(trie_node.depth).copied().unwrap_or(0);
 
                         if trie_node.depth == key_bytes.len() {
@@ -201,7 +473,7 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
 
                                     if btree_node.keys.len() > BTREE_MAX_KEYS {
                                         let split_info: Option<SplitInfo<K, V>> =
-                                            self.split_btree_node(btree_node);
+                                            utils::split_btree_node(btree_node);
                                         if let Some(split_info) = split_info {
                                             // Handle root split
                                             if path.is_empty() {
@@ -220,7 +492,7 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
                                                 let (parent, child_idx) = path.pop().unwrap();
                                                 let mut parent = parent.write().unwrap();
                                                 if let NodeType::BTree(parent_node) = &mut *parent {
-                                                    self.handle_split(
+                                                    utils::handle_split(
                                                         parent_node,
                                                         child_idx,
                                                         split_info,
@@ -232,7 +504,7 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
                                         < BTREE_MIN_OCCUPANCY
                                     {
                                         // Convert back to trie if occupancy is too low
-                                        *node = self.convert_to_trie(btree_node);
+                                        *node = utils::convert_to_trie(btree_node);
                                     }
                                     break;
                                 }
@@ -255,239 +527,6 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
 
         self.size.fetch_add(1, Ordering::Relaxed);
         old_value
-    }
-
-    // Helper method to convert key to bytes for trie traversal
-    fn key_to_bytes(&self, key: &K) -> Vec<u8> {
-        key.to_bytes()
-    }
-
-    // Helper method to handle the split info and update parent node
-    fn handle_split(
-        &self,
-        parent: &mut BTreeNode<K, V>,
-        child_idx: usize,
-        split_info: SplitInfo<K, V>,
-    ) {
-        // Insert the median key and value at the correct position
-        parent.keys.insert(child_idx, split_info.median_key);
-        parent.values.insert(child_idx, split_info.median_value);
-
-        // Insert the new right child
-        parent.children.insert(child_idx + 1, split_info.right_node);
-    }
-
-    fn split_btree_node(&self, node: &mut BTreeNode<K, V>) -> Option<SplitInfo<K, V>> {
-        let mid: usize = BTREE_MAX_KEYS / 2;
-
-        // Create a new right node
-        let mut right_node: BTreeNode<K, V> = BTreeNode {
-            keys: Vec::with_capacity(BTREE_MAX_KEYS),
-            values: Vec::with_capacity(BTREE_MAX_KEYS),
-            children: Vec::with_capacity(BTREE_MAX_KEYS + 1),
-            is_leaf: node.is_leaf,
-        };
-
-        // For leaf nodes
-        if node.is_leaf {
-            // Move half of the keys and values to the right node
-            right_node.keys = node.keys.split_off(mid);
-            right_node.values = node.values.split_off(mid);
-
-            // Create SplitInfo with the first key of right node (no key is moved up)
-            let median_key: K = right_node.keys[0].clone();
-            let median_value: V = right_node.values[0].clone();
-
-            // Wrap the right node
-            let right_node = Arc::new(RwLock::new(NodeType::BTree(right_node)));
-
-            Some(SplitInfo {
-                median_key,
-                median_value,
-                right_node,
-            })
-        }
-        // For internal nodes
-        else {
-            // Save the median key and value (they will move up)
-            let median_key: K = node.keys[mid].clone();
-            let median_value: V = node.values[mid].clone();
-
-            // Move keys and values after median to right node
-            right_node.keys = node.keys.split_off(mid + 1);
-            right_node.values = node.values.split_off(mid + 1);
-
-            // Remove the median key and value from the left node
-            node.keys.pop();
-            node.values.pop();
-
-            // Move the corresponding children
-            right_node.children = node.children.split_off(mid + 1);
-
-            // Wrap the right node
-            let right_node: Arc<RwLock<NodeType<K, V>>> =
-                Arc::new(RwLock::new(NodeType::BTree(right_node)));
-
-            Some(SplitInfo {
-                median_key,
-                median_value,
-                right_node,
-            })
-        }
-    }
-
-    // Helper method to collect key-value pairs from trie
-    fn collect_pairs(&self, node: &TrieNode<K, V>, prefix: Vec<u8>, pairs: &mut Vec<(K, V)>) {
-        // If this node has a value, reconstruct the key and add the pair
-        if let Some(value) = &node.value {
-            if let Some(key) = K::from_bytes(&prefix) {
-                pairs.push((key, value.clone()));
-            }
-        }
-
-        // Recursively traverse all children
-        for (byte, child_opt) in node.children.iter().enumerate() {
-            if let Some(child) = child_opt {
-                let mut new_prefix = prefix.clone();
-                new_prefix.push(byte as u8);
-
-                if let Ok(guard) = child.read() {
-                    if let NodeType::Trie(child_trie) = &*guard {
-                        self.collect_pairs(child_trie, new_prefix, pairs);
-                    }
-                }
-            }
-        }
-    }
-
-    fn convert_to_btree(&self, trie_node: &TrieNode<K, V>) -> NodeType<K, V> {
-        // Create a new B+ tree leaf node
-        let mut btree_node = BTreeNode {
-            keys: Vec::with_capacity(BTREE_MAX_KEYS),
-            values: Vec::with_capacity(BTREE_MAX_KEYS),
-            children: Vec::new(),
-            is_leaf: true,
-        };
-
-        let mut pairs: Vec<(K, V)> = Vec::new();
-
-        // Collect all key-value pairs from the trie
-        self.collect_pairs(trie_node, Vec::new(), &mut pairs);
-
-        // Sort pairs by key
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Fill the B+ tree node with sorted pairs
-        for (key, value) in pairs {
-            btree_node.keys.push(key);
-            btree_node.values.push(value);
-        }
-
-        // Check if we need to split the node
-        if btree_node.keys.len() > BTREE_MAX_KEYS {
-            let mut root = BTreeNode {
-                keys: Vec::new(),
-                values: Vec::new(),
-                children: Vec::new(),
-                is_leaf: false,
-            };
-
-            // Split the oversized leaf node
-            let split_info = self.split_btree_node(&mut btree_node).unwrap();
-
-            // Create root node with two children
-            root.keys.push(split_info.median_key);
-            root.values.push(split_info.median_value);
-            root.children
-                .push(Arc::new(RwLock::new(NodeType::BTree(btree_node))));
-            root.children.push(split_info.right_node);
-
-            NodeType::BTree(root)
-        } else {
-            NodeType::BTree(btree_node)
-        }
-    }
-
-    // Helper function to insert a key-value pair into the trie
-    fn insert_into_trie(
-        root: &mut TrieNode<K, V>,
-        key: &K,
-        value: V,
-        current_depth: usize,
-        key_bytes: &[u8],
-    ) {
-        if current_depth == key_bytes.len() {
-            // We've reached the end of the key, store the value
-            root.value = Some(value);
-            root.size.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-
-        let current_byte = key_bytes[current_depth] as usize;
-
-        // Create new node if it doesn't exist
-        if root.children[current_byte].is_none() {
-            root.children[current_byte] = Some(Arc::new(RwLock::new(NodeType::Trie(TrieNode {
-                children: vec![None; 256],
-                value: None,
-                depth: current_depth + 1,
-                size: AtomicUsize::new(0),
-            }))));
-        }
-
-        // Get mutable reference to child node
-        if let Some(child_arc) = &root.children[current_byte] {
-            if let Ok(mut child_lock) = child_arc.write() {
-                if let NodeType::Trie(child_trie) = &mut *child_lock {
-                    Self::insert_into_trie(child_trie, key, value, current_depth + 1, key_bytes);
-                }
-            }
-        }
-    }
-
-    // Helper function to collect leaf pairs from B+ tree
-    fn collect_leaf_pairs(node: &BTreeNode<K, V>, pairs: &mut Vec<(K, V)>) {
-        if node.is_leaf {
-            pairs.extend(node.keys.iter().cloned().zip(node.values.iter().cloned()));
-        } else {
-            // Recursively collect from all children
-            for child in &node.children {
-                if let Ok(child_guard) = child.read() {
-                    if let NodeType::BTree(child_btree) = &*child_guard {
-                        Self::collect_leaf_pairs(child_btree, pairs);
-                    }
-                }
-            }
-        }
-    }
-
-    fn convert_to_trie(&self, btree_node: &BTreeNode<K, V>) -> NodeType<K, V> {
-        // Create root trie node
-        let mut root = TrieNode {
-            children: vec![None; 256],
-            value: None,
-            depth: 0,
-            size: AtomicUsize::new(0),
-        };
-
-        // If this is a leaf node, directly convert all key-value pairs
-        if btree_node.is_leaf {
-            for (key, value) in btree_node.keys.iter().zip(btree_node.values.iter()) {
-                let key_bytes = key.to_bytes();
-                Self::insert_into_trie(&mut root, key, value.clone(), 0, &key_bytes);
-            }
-        } else {
-            let mut all_pairs = Vec::new();
-            Self::collect_leaf_pairs(btree_node, &mut all_pairs);
-
-            // Insert all collected pairs into the trie
-            for (key, value) in all_pairs {
-                let key_bytes = key.to_bytes();
-                Self::insert_into_trie(&mut root, &key, value, 0, &key_bytes);
-            }
-        }
-
-        NodeType::Trie(root)
     }
 }
 
