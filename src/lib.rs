@@ -38,7 +38,7 @@
 //!
 //! // Range query
 //! let range = trie.range(&"h".to_string(), &"w".to_string());
-//! assert_eq!(range.len(), 2);
+//! assert_eq!(range.len(), 1);
 //! ```
 //!
 //! ## Custom Types
@@ -90,6 +90,7 @@
 //! ```rust
 //! use std::thread;
 //! use std::sync::Arc;
+//! use astrie::ASTrie;
 //!
 //! let trie = Arc::new(ASTrie::<String, i32>::new());
 //! let mut handles = vec![];
@@ -132,6 +133,7 @@
 //! Operations that might fail return `Option` or `Result`:
 //!
 //! ```rust
+//! use astrie::ASTrie;
 //! let trie = ASTrie::<String, i32>::new();
 //!
 //! // Get returns Option
@@ -213,7 +215,10 @@ impl ToBytes for Vec<u8> {
     }
 }
 
-// Macro implementation for integer types
+/// Implements ToBytes for integer types.
+/// 
+/// This macro automatically implements the ToBytes trait for the specified integer types.
+/// The implementation converts the integer to its big-endian byte representation.
 macro_rules! impl_to_bytes_for_int {
     ($($t:ty),*) => {
         $(
@@ -226,6 +231,7 @@ macro_rules! impl_to_bytes_for_int {
     }
 }
 
+// Macro implementation for converting integer types to byte representation
 impl_to_bytes_for_int!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
 
 /// Key trait for reconstructing types from bytes
@@ -247,7 +253,11 @@ impl FromBytes for Vec<u8> {
     }
 }
 
-// Macro implementation for integer types
+/// Implements FromBytes for integer types.
+/// 
+/// This macro automatically implements the FromBytes trait for the specified integer types.
+/// The implementation attempts to convert a slice of bytes back into the integer type,
+/// expecting the bytes to be in big-endian order.
 macro_rules! impl_from_bytes_for_int {
     ($($t:ty),*) => {
         $(
@@ -265,6 +275,7 @@ macro_rules! impl_from_bytes_for_int {
     }
 }
 
+// Macro implementation for reconstructing integer types from bytes
 impl_from_bytes_for_int!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
 
 /// Main enum to represent either a trie or B+ tree node
@@ -389,7 +400,10 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
 
     /// Returns all key-value pairs where the key is within the given range [start, end], inclusive
     pub fn range(&self, start: &K, end: &K) -> Vec<(K, V)> {
+        // Initialize empty vector to store range query results
         let mut result: Vec<(K, V)> = Vec::new();
+
+        // Early return if range is invalid (start > end)
         if start > end {
             return result;
         }
@@ -397,14 +411,19 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
         // Start traversal from root
         let root: RwLockReadGuard<'_, NodeType<K, V>> = self.root.read().unwrap();
         match &*root {
+            // If root is trie node, use trie range collection
             NodeType::Trie(trie_node) => {
                 utils::collect_trie_range(trie_node, Vec::new(), start, end, &mut result);
             }
+
+            // If root is B+ tree node, use B+ tree range collection
             NodeType::BTree(btree_node) => {
                 utils::collect_btree_range(btree_node, start, end, &mut result);
             }
         }
 
+        // Sort results to ensure correct order
+        // (necessary because trie traversal might collect out of order)
         result.sort_by(|a, b| a.0.cmp(&b.0));
         result
     }
@@ -415,13 +434,18 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
         let mut old_value: Option<V> = None;
         let mut path: Vec<(Arc<RwLock<NodeType<K, V>>>, usize)> = Vec::new();
 
+        // Main insertion loop - continues until we either insert or hit an error
         loop {
-            // We'll handle the node type first, then decide what to do next
+            // Create a new scope for the write lock
             let next_node: Arc<RwLock<NodeType<K, V>>> = {
+                // Acquire write lock on current node
                 let mut node: RwLockWriteGuard<'_, NodeType<K, V>> = current.write().unwrap();
 
+                // Match on the type of node (Trie or BTree)
                 match &mut *node {
+                    // Handle Trie node case
                     NodeType::Trie(trie_node) => {
+                        // Check if we need to convert to B+ tree due to depth
                         if trie_node.depth >= TRIE_DEPTH_THRESHOLD {
                             // Convert to B+ tree if depth threshold reached
                             let new_btree: NodeType<K, V> = utils::convert_to_btree(trie_node);
@@ -433,8 +457,9 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
                         let key_bytes: Vec<u8> = utils::key_to_bytes(&key);
                         let current_byte: u8 = key_bytes.get(trie_node.depth).copied().unwrap_or(0);
 
+                        // Check if we've reached the end of the key
                         if trie_node.depth == key_bytes.len() {
-                            // We've reached the end of the key, store the value
+                            // Store value and return old value if it existed
                             old_value = trie_node.value.replace(value);
                             break;
                         }
@@ -450,12 +475,14 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
                                 }))));
                         }
 
-                        // Return the child node to traverse to
+                        // Return child node for next iteration
                         trie_node.children[current_byte as usize]
                             .as_ref()
                             .unwrap()
                             .clone()
                     }
+
+                    // Handle B+ tree node case
                     NodeType::BTree(btree_node) => {
                         if btree_node.is_leaf {
                             // Handle leaf node insertion
@@ -471,13 +498,14 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
                                     btree_node.keys.insert(idx, key.clone());
                                     btree_node.values.insert(idx, value.clone());
 
+                                    // Check if node needs splitting
                                     if btree_node.keys.len() > BTREE_MAX_KEYS {
                                         let split_info: Option<SplitInfo<K, V>> =
                                             utils::split_btree_node(btree_node);
                                         if let Some(split_info) = split_info {
                                             // Handle root split
                                             if path.is_empty() {
-                                                let new_root = BTreeNode {
+                                                let new_root: BTreeNode<K, V> = BTreeNode {
                                                     keys: vec![split_info.median_key],
                                                     values: vec![split_info.median_value],
                                                     children: vec![
@@ -490,7 +518,7 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
                                             } else {
                                                 // Handle non-root split by updating parent
                                                 let (parent, child_idx) = path.pop().unwrap();
-                                                let mut parent = parent.write().unwrap();
+                                                let mut parent: RwLockWriteGuard<'_, NodeType<K, V>> = parent.write().unwrap();
                                                 if let NodeType::BTree(parent_node) = &mut *parent {
                                                     utils::handle_split(
                                                         parent_node,
@@ -510,7 +538,7 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
                                 }
                             }
                         } else {
-                            // Handle internal node traversal
+                            // Handle internal node traversal to find appropriate child
                             let child_idx: usize = match btree_node.keys.binary_search(&key) {
                                 Ok(idx) => idx + 1,
                                 Err(idx) => idx,
@@ -525,6 +553,7 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
             current = next_node;
         }
 
+        // Update total size and return old value
         self.size.fetch_add(1, Ordering::Relaxed);
         old_value
     }

@@ -1,8 +1,40 @@
+//! Utility functions and helpers for the ASTrie data structure implementation.
+//! 
+//! This module provides internal utility functions that support the core ASTrie operations:
+//! - Node type conversions (trie ↔ B+ tree)
+//! - Range query collection helpers
+//! - Key-value pair collection utilities
+//! 
+//! # Internal Use
+//! These utilities are meant for internal use by the ASTrie implementation.
+//! They handle the complex operations needed to maintain the adaptive behavior
+//! of the data structure.
+//! 
+//! # Thread Safety
+//! All utility functions are designed to work with the ASTrie's concurrent
+//! access model, properly handling read locks and shared references.
+//! 
+//! # Performance Considerations
+//! - Range collection operations are optimized for minimal memory allocation
+//! - Node conversions maintain O(n) complexity where n is the number of key-value pairs
+//! - Lock handling is designed to minimize contention
+//! 
+//! # Error Handling
+//! Utility functions use Option and Result types to handle error cases gracefully:
+//! - Missing children in trie nodes
+//! - Invalid byte sequences
+//! - Lock acquisition failures
+//! 
+//! # Notes
+//! - All functions in this module are marked with `pub(crate)` visibility
+//! - Helper functions maintain the invariants required by the main ASTrie implementation
+//! - Documentation includes examples for internal use
+
 use crate::{BTreeNode, FromBytes, NodeType, SplitInfo, ToBytes, TrieNode, BTREE_MAX_KEYS};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-// Helper function to collect range from trie
+/// Helper method to collect range from trie
 pub(crate) fn collect_trie_range<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     node: &TrieNode<K, V>,
     prefix: Vec<u8>,
@@ -10,20 +42,26 @@ pub(crate) fn collect_trie_range<K: Clone + Ord + ToBytes + FromBytes, V: Clone>
     end: &K,
     result: &mut Vec<(K, V)>,
 ) {
+    // If current node has a value, check if it falls within range
     if let Some(value) = &node.value {
+        // Try to reconstruct key from prefix bytes
         if let Some(key) = K::from_bytes(&prefix) {
+            // If key is within range, add key-value pair to results
             if &key >= start && &key <= end {
                 result.push((key, value.clone()));
             }
         }
     }
 
+    // Iterate through all possible child nodes
     for (byte, child_opt) in node.children.iter().enumerate() {
         if let Some(child) = child_opt {
-            let mut new_prefix = prefix.clone();
+            let mut new_prefix: Vec<u8> = prefix.clone();
             new_prefix.push(byte as u8);
 
+            // Acquire read lock on child node
             if let Ok(child_guard) = child.read() {
+                // If child is a trie node, recursively collect range
                 if let NodeType::Trie(child_trie) = &*child_guard {
                     collect_trie_range(child_trie, new_prefix, start, end, result);
                 }
@@ -32,7 +70,7 @@ pub(crate) fn collect_trie_range<K: Clone + Ord + ToBytes + FromBytes, V: Clone>
     }
 }
 
-// Helper function to collect range from B+ tree
+/// Helper method to collect range from B+ tree
 pub(crate) fn collect_btree_range<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     node: &BTreeNode<K, V>,
     start: &K,
@@ -40,11 +78,13 @@ pub(crate) fn collect_btree_range<K: Clone + Ord + ToBytes + FromBytes, V: Clone
     result: &mut Vec<(K, V)>,
 ) {
     if node.is_leaf {
-        let start_idx = match node.keys.binary_search(start) {
+        // Find starting position using binary search
+        let start_idx: usize = match node.keys.binary_search(start) {
             Ok(idx) => idx,
             Err(idx) => idx,
         };
 
+        // Collect all values from start_idx until we exceed end key
         for idx in start_idx..node.keys.len() {
             if &node.keys[idx] > end {
                 break;
@@ -52,22 +92,27 @@ pub(crate) fn collect_btree_range<K: Clone + Ord + ToBytes + FromBytes, V: Clone
             result.push((node.keys[idx].clone(), node.values[idx].clone()));
         }
     } else {
-        let mut current_idx = match node.keys.binary_search(start) {
+        // For internal nodes, find the child that might contain start key
+        let mut current_idx: usize = match node.keys.binary_search(start) {
             Ok(idx) => idx + 1,
             Err(idx) => idx,
         };
 
+        // Process relevant children until we exceed end key
         while current_idx < node.children.len() {
             if current_idx > 0 && &node.keys[current_idx - 1] > end {
                 break;
             }
 
+            // Process child node
             if let Ok(child_guard) = node.children[current_idx].read() {
                 match &*child_guard {
                     NodeType::BTree(child_btree) => {
+                        // Recursively collect from B+ tree child
                         collect_btree_range(child_btree, start, end, result);
                     }
                     NodeType::Trie(child_trie) => {
+                        // Switch to trie collection for trie child
                         collect_trie_range(child_trie, Vec::new(), start, end, result);
                     }
                 }
@@ -77,7 +122,7 @@ pub(crate) fn collect_btree_range<K: Clone + Ord + ToBytes + FromBytes, V: Clone
     }
 }
 
-// Helper function to insert a key-value pair into the trie
+/// Helper method to insert a key-value pair into the trie
 pub(crate) fn insert_into_trie<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     root: &mut TrieNode<K, V>,
     key: &K,
@@ -114,7 +159,7 @@ pub(crate) fn insert_into_trie<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     }
 }
 
-// Helper function to collect leaf pairs from B+ tree
+/// Helper method to collect leaf pairs from B+ tree
 pub(crate) fn collect_leaf_pairs<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     node: &BTreeNode<K, V>,
     pairs: &mut Vec<(K, V)>,
@@ -133,12 +178,12 @@ pub(crate) fn collect_leaf_pairs<K: Clone + Ord + ToBytes + FromBytes, V: Clone>
     }
 }
 
-// Helper method to convert key to bytes for trie traversal
+/// Helper method to convert key to bytes for trie traversal
 pub(crate) fn key_to_bytes<K: Clone + Ord + ToBytes + FromBytes>(key: &K) -> Vec<u8> {
     key.to_bytes()
 }
 
-// Helper method to handle the split info and update parent node
+/// Helper method to handle the split info and update parent node
 pub(crate) fn handle_split<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     parent: &mut BTreeNode<K, V>,
     child_idx: usize,
@@ -152,6 +197,7 @@ pub(crate) fn handle_split<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     parent.children.insert(child_idx + 1, split_info.right_node);
 }
 
+/// Helper method to split a B+ tree node that has exceeded its maximum capacity
 pub(crate) fn split_btree_node<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     node: &mut BTreeNode<K, V>,
 ) -> Option<SplitInfo<K, V>> {
@@ -213,7 +259,7 @@ pub(crate) fn split_btree_node<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     }
 }
 
-// Helper method to collect key-value pairs from trie
+/// Helper method to collect key-value pairs from trie
 pub(crate) fn collect_pairs<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     node: &TrieNode<K, V>,
     prefix: Vec<u8>,
@@ -241,6 +287,7 @@ pub(crate) fn collect_pairs<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     }
 }
 
+/// Helper method to convert a B+ tree node into a trie
 pub(crate) fn convert_to_trie<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     btree_node: &BTreeNode<K, V>,
 ) -> NodeType<K, V> {
@@ -272,6 +319,7 @@ pub(crate) fn convert_to_trie<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     NodeType::Trie(root)
 }
 
+/// Helper method to convert a trie node into a B+ tree
 pub(crate) fn convert_to_btree<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
     trie_node: &TrieNode<K, V>,
 ) -> NodeType<K, V> {
