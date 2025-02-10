@@ -216,7 +216,7 @@ impl ToBytes for Vec<u8> {
 }
 
 /// Implements ToBytes for integer types.
-/// 
+///
 /// This macro automatically implements the ToBytes trait for the specified integer types.
 /// The implementation converts the integer to its big-endian byte representation.
 macro_rules! impl_to_bytes_for_int {
@@ -254,7 +254,7 @@ impl FromBytes for Vec<u8> {
 }
 
 /// Implements FromBytes for integer types.
-/// 
+///
 /// This macro automatically implements the FromBytes trait for the specified integer types.
 /// The implementation attempts to convert a slice of bytes back into the integer type,
 /// expecting the bytes to be in big-endian order.
@@ -518,7 +518,10 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
                                             } else {
                                                 // Handle non-root split by updating parent
                                                 let (parent, child_idx) = path.pop().unwrap();
-                                                let mut parent: RwLockWriteGuard<'_, NodeType<K, V>> = parent.write().unwrap();
+                                                let mut parent: RwLockWriteGuard<
+                                                    '_,
+                                                    NodeType<K, V>,
+                                                > = parent.write().unwrap();
                                                 if let NodeType::BTree(parent_node) = &mut *parent {
                                                     utils::handle_split(
                                                         parent_node,
@@ -557,6 +560,141 @@ impl<K: Clone + Ord + ToBytes + FromBytes, V: Clone> ASTrie<K, V> {
         self.size.fetch_add(1, Ordering::Relaxed);
         old_value
     }
+
+    /// Updates the value associated with a key if it exists
+    /// Returns the old value if the key existed, None otherwise
+    pub fn update(&self, key: &K, new_value: V) -> Option<V> {
+        let key_bytes: Vec<u8> = key.to_bytes();
+        let mut current: Arc<RwLock<NodeType<K, V>>> = self.root.clone();
+
+        loop {
+            let next_node: Option<Arc<RwLock<NodeType<K, V>>>> = {
+                let mut node: RwLockWriteGuard<'_, NodeType<K, V>> = current.write().unwrap();
+                match &mut *node {
+                    NodeType::Trie(trie_node) => {
+                        if trie_node.depth == key_bytes.len() {
+                            // Found the key, update the value
+                            return trie_node.value.replace(new_value);
+                        }
+
+                        let current_byte = key_bytes[trie_node.depth] as usize;
+                        match &trie_node.children[current_byte] {
+                            Some(child) => Some(child.clone()),
+                            None => None,
+                        }
+                    }
+                    NodeType::BTree(btree_node) => {
+                        if btree_node.is_leaf {
+                            match btree_node.keys.binary_search(key) {
+                                Ok(idx) => {
+                                    // Found the key, update the value
+                                    return Some(std::mem::replace(
+                                        &mut btree_node.values[idx],
+                                        new_value,
+                                    ));
+                                }
+                                Err(_) => return None,
+                            }
+                        } else {
+                            let child_idx: usize = match btree_node.keys.binary_search(key) {
+                                Ok(idx) => idx + 1,
+                                Err(idx) => idx,
+                            };
+                            Some(btree_node.children[child_idx].clone())
+                        }
+                    }
+                }
+            };
+
+            match next_node {
+                Some(next) => current = next,
+                None => return None,
+            }
+        }
+    }
+
+    /// Deletes a key and its associated value from the ASTrie
+    /// Returns the value if the key existed, None otherwise
+    pub fn delete(&self, key: &K) -> Option<V> {
+        let key_bytes = key.to_bytes();
+        let mut current = self.root.clone();
+        let mut path: Vec<(Arc<RwLock<NodeType<K, V>>>, usize)> = Vec::new();
+
+        // First, find the node containing the key
+        loop {
+            let next_node: Option<Arc<RwLock<NodeType<K, V>>>> = {
+                let node: RwLockReadGuard<'_, NodeType<K, V>> = current.read().unwrap();
+                match &*node {
+                    NodeType::Trie(trie_node) => {
+                        if trie_node.depth == key_bytes.len() {
+                            break; // Found the node
+                        }
+
+                        let current_byte: usize = key_bytes[trie_node.depth] as usize;
+                        match &trie_node.children[current_byte] {
+                            Some(child) => {
+                                path.push((current.clone(), current_byte));
+                                Some(child.clone())
+                            }
+                            None => None,
+                        }
+                    }
+                    NodeType::BTree(btree_node) => {
+                        if btree_node.is_leaf {
+                            break; // Found the leaf node
+                        } else {
+                            let child_idx: usize = match btree_node.keys.binary_search(key) {
+                                Ok(idx) => idx + 1,
+                                Err(idx) => idx,
+                            };
+                            path.push((current.clone(), child_idx));
+                            Some(btree_node.children[child_idx].clone())
+                        }
+                    }
+                }
+            };
+
+            match next_node {
+                Some(next) => current = next,
+                None => return None,
+            }
+        }
+
+        // Now delete the key
+        #[allow(unused_assignments)]
+        let mut value_to_return: Option<V> = None;
+        {
+            let mut node: RwLockWriteGuard<'_, NodeType<K, V>> = current.write().unwrap();
+            match &mut *node {
+                NodeType::Trie(trie_node) => {
+                    value_to_return = trie_node.value.take();
+                    trie_node.size.fetch_sub(1, Ordering::Relaxed);
+                }
+                NodeType::BTree(btree_node) => {
+                    match btree_node.keys.binary_search(key) {
+                        Ok(idx) => {
+                            value_to_return = Some(btree_node.values.remove(idx));
+                            btree_node.keys.remove(idx);
+
+                            // Check if we need to merge nodes
+                            if !btree_node.is_leaf && btree_node.keys.len() < BTREE_MAX_KEYS / 4 {
+                                utils::merge_btree_nodes(btree_node, &path);
+                            }
+                        }
+                        Err(_) => return None,
+                    }
+                }
+            }
+        }
+
+        // Clean up empty trie nodes
+        if let Some(_value) = value_to_return.as_ref() {
+            utils::cleanup_empty_trie_nodes(&path);
+            self.size.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        value_to_return
+    }
 }
 
 #[cfg(test)]
@@ -566,7 +704,7 @@ mod tests {
     // Utility function to create a test trie node
     fn create_test_trie_node<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
         value: Option<V>,
-        depth: usize
+        depth: usize,
     ) -> TrieNode<K, V> {
         TrieNode {
             children: vec![None; 256],
@@ -580,7 +718,7 @@ mod tests {
     fn create_test_btree_node<K: Clone + Ord + ToBytes + FromBytes, V: Clone>(
         keys: Vec<K>,
         values: Vec<V>,
-        is_leaf: bool
+        is_leaf: bool,
     ) -> BTreeNode<K, V> {
         BTreeNode {
             keys,
@@ -594,7 +732,7 @@ mod tests {
     fn test_collect_trie_range() {
         let mut result: Vec<(String, i32)> = Vec::new();
         let mut node: TrieNode<String, i32> = create_test_trie_node::<String, i32>(Some(1), 0);
-        
+
         // Create a simple trie structure
         let child: TrieNode<String, i32> = create_test_trie_node(Some(2), 1);
         node.children[97] = Some(Arc::new(RwLock::new(NodeType::Trie(child)))); // 'a'
@@ -604,7 +742,7 @@ mod tests {
             Vec::new(),
             &"a".to_string(),
             &"c".to_string(),
-            &mut result
+            &mut result,
         );
 
         assert_eq!(result.len(), 1);
@@ -617,7 +755,7 @@ mod tests {
         let node: BTreeNode<i32, String> = create_test_btree_node(
             vec![1, 3, 5],
             vec!["one".to_string(), "three".to_string(), "five".to_string()],
-            true
+            true,
         );
 
         utils::collect_btree_range(&node, &1, &4, &mut result);
@@ -640,7 +778,7 @@ mod tests {
         fn verify_path(
             node: &Option<Arc<RwLock<NodeType<String, i32>>>>,
             remaining_bytes: &[u8],
-            expected_value: i32
+            expected_value: i32,
         ) -> bool {
             match node {
                 None => false,
@@ -655,9 +793,9 @@ mod tests {
                                 verify_path(
                                     &trie_node.children[next_byte],
                                     &remaining_bytes[1..],
-                                    expected_value
+                                    expected_value,
                                 )
-                            },
+                            }
                             _ => false,
                         }
                     } else {
@@ -668,25 +806,27 @@ mod tests {
         }
 
         // Start verification from root's children
-        let first_byte = key_bytes[0] as usize;
-        assert!(verify_path(&root.children[first_byte], &key_bytes[1..], value));
+        let first_byte: usize = key_bytes[0] as usize;
+        assert!(verify_path(
+            &root.children[first_byte],
+            &key_bytes[1..],
+            value
+        ));
     }
 
     #[test]
     fn test_collect_leaf_pairs() {
         let mut pairs: Vec<(i32, String)> = Vec::new();
-        let leaf1: BTreeNode<i32, String> = create_test_btree_node(
-            vec![1, 2],
-            vec!["one".to_string(), "two".to_string()],
-            true
-        );
+        let leaf1: BTreeNode<i32, String> =
+            create_test_btree_node(vec![1, 2], vec!["one".to_string(), "two".to_string()], true);
         let leaf2: BTreeNode<i32, String> = create_test_btree_node(
             vec![3, 4],
             vec!["three".to_string(), "four".to_string()],
-            true
+            true,
         );
 
-        let mut parent: BTreeNode<i32, String> = create_test_btree_node(vec![3], vec!["three".to_string()], false);
+        let mut parent: BTreeNode<i32, String> =
+            create_test_btree_node(vec![3], vec!["three".to_string()], false);
         parent.children = vec![
             Arc::new(RwLock::new(NodeType::BTree(leaf1))),
             Arc::new(RwLock::new(NodeType::BTree(leaf2))),
@@ -702,7 +842,7 @@ mod tests {
     #[test]
     fn test_handle_split() {
         // Create a parent node with initial children
-        let mut parent = BTreeNode {
+        let mut parent: BTreeNode<i32, String> = BTreeNode {
             keys: vec![1, 5],
             values: vec!["one".to_string(), "five".to_string()],
             children: vec![
@@ -729,15 +869,16 @@ mod tests {
         };
 
         // Create the right node that results from a split
-        let right_node = Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
-            keys: vec![4],
-            values: vec!["four".to_string()],
-            children: Vec::new(),
-            is_leaf: true,
-        })));
+        let right_node: Arc<RwLock<NodeType<i32, String>>> =
+            Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
+                keys: vec![4],
+                values: vec!["four".to_string()],
+                children: Vec::new(),
+                is_leaf: true,
+            })));
 
         // Create split info
-        let split_info = SplitInfo {
+        let split_info: SplitInfo<i32, String> = SplitInfo {
             median_key: 3,
             median_value: "three".to_string(),
             right_node: right_node.clone(),
@@ -753,16 +894,24 @@ mod tests {
             vec!["one".to_string(), "three".to_string(), "five".to_string()],
             "Values should be [one, three, five]"
         );
-        assert_eq!(parent.children.len(), 4, "Should have 4 children after split");
+        assert_eq!(
+            parent.children.len(),
+            4,
+            "Should have 4 children after split"
+        );
 
         // Helper function to safely verify a child node
-        fn verify_child_node(child: &Arc<RwLock<NodeType<i32, String>>>, expected_keys: Vec<i32>, expected_values: Vec<String>) -> bool {
+        fn verify_child_node(
+            child: &Arc<RwLock<NodeType<i32, String>>>,
+            expected_keys: Vec<i32>,
+            expected_values: Vec<String>,
+        ) -> bool {
             if let Ok(guard) = child.read() {
                 match &*guard {
                     NodeType::BTree(node) => {
                         node.keys == expected_keys && node.values == expected_values
-                    },
-                    _ => false
+                    }
+                    _ => false,
                 }
             } else {
                 false
@@ -770,14 +919,22 @@ mod tests {
         }
 
         // Verify children order
-        assert!(verify_child_node(&parent.children[0], vec![0], vec!["zero".to_string()]), 
-            "First child should have key [0]");
-        assert!(verify_child_node(&parent.children[1], vec![2], vec!["two".to_string()]), 
-            "Second child should have key [2]");
-        assert!(verify_child_node(&parent.children[2], vec![4], vec!["four".to_string()]), 
-            "Third child should have key [4]");
-        assert!(verify_child_node(&parent.children[3], vec![6], vec!["six".to_string()]), 
-            "Fourth child should have key [6]");
+        assert!(
+            verify_child_node(&parent.children[0], vec![0], vec!["zero".to_string()]),
+            "First child should have key [0]"
+        );
+        assert!(
+            verify_child_node(&parent.children[1], vec![2], vec!["two".to_string()]),
+            "Second child should have key [2]"
+        );
+        assert!(
+            verify_child_node(&parent.children[2], vec![4], vec!["four".to_string()]),
+            "Third child should have key [4]"
+        );
+        assert!(
+            verify_child_node(&parent.children[3], vec![6], vec!["six".to_string()]),
+            "Fourth child should have key [6]"
+        );
     }
 
     #[test]
@@ -790,7 +947,7 @@ mod tests {
                 "2".to_string(),
                 "3".to_string(),
                 "4".to_string(),
-                "5".to_string()
+                "5".to_string(),
             ],
             children: Vec::new(),
             is_leaf: true,
@@ -812,13 +969,12 @@ mod tests {
             match &*guard {
                 NodeType::BTree(right) => {
                     assert_eq!(right.keys, vec![3, 4, 5]);
-                    assert_eq!(right.values, vec![
-                        "3".to_string(),
-                        "4".to_string(),
-                        "5".to_string()
-                    ]);
+                    assert_eq!(
+                        right.values,
+                        vec!["3".to_string(), "4".to_string(), "5".to_string()]
+                    );
                     assert!(right.is_leaf);
-                },
+                }
                 _ => panic!("Expected BTree node"),
             }
         }
@@ -832,7 +988,7 @@ mod tests {
                 "10".to_string(),
                 "20".to_string(),
                 "30".to_string(),
-                "40".to_string()
+                "40".to_string(),
             ],
             children: vec![
                 Arc::new(RwLock::new(NodeType::BTree(BTreeNode {
@@ -888,7 +1044,7 @@ mod tests {
                     assert_eq!(right.values, vec!["40".to_string()]);
                     assert_eq!(right.children.len(), 2);
                     assert!(!right.is_leaf);
-                },
+                }
                 _ => panic!("Expected BTree node"),
             }
         }
@@ -900,11 +1056,11 @@ mod tests {
     fn test_collect_pairs() {
         let mut pairs: Vec<(String, i32)> = Vec::new();
         let mut node: TrieNode<String, i32> = create_test_trie_node::<String, i32>(Some(1), 0);
-        
+
         // Add some children
         let child1: TrieNode<String, i32> = create_test_trie_node(Some(2), 1);
         let child2: TrieNode<String, i32> = create_test_trie_node(Some(3), 1);
-        
+
         node.children[97] = Some(Arc::new(RwLock::new(NodeType::Trie(child1)))); // 'a'
         node.children[98] = Some(Arc::new(RwLock::new(NodeType::Trie(child2)))); // 'b'
 
@@ -915,23 +1071,20 @@ mod tests {
 
     #[test]
     fn test_convert_to_trie() {
-        let btree: BTreeNode<String, i32> = create_test_btree_node(
-            vec!["a".to_string(), "b".to_string()],
-            vec![1, 2],
-            true
-        );
+        let btree: BTreeNode<String, i32> =
+            create_test_btree_node(vec!["a".to_string(), "b".to_string()], vec![1, 2], true);
 
         let result: NodeType<String, i32> = utils::convert_to_trie(&btree);
-        
+
         match result {
             NodeType::Trie(trie) => {
                 // Verify first key-value pair
                 let key_bytes: &[u8] = "a".as_bytes();
-                
+
                 fn verify_trie_path(
                     children: &[Option<Arc<RwLock<NodeType<String, i32>>>>],
                     bytes: &[u8],
-                    expected_value: i32
+                    expected_value: i32,
                 ) -> bool {
                     if bytes.is_empty() {
                         return false;
@@ -945,9 +1098,13 @@ mod tests {
                                     if bytes.len() == 1 {
                                         trie_node.value == Some(expected_value)
                                     } else {
-                                        verify_trie_path(&trie_node.children, &bytes[1..], expected_value)
+                                        verify_trie_path(
+                                            &trie_node.children,
+                                            &bytes[1..],
+                                            expected_value,
+                                        )
                                     }
-                                },
+                                }
                                 _ => false,
                             }
                         } else {
@@ -959,7 +1116,7 @@ mod tests {
                 }
 
                 assert!(verify_trie_path(&trie.children, key_bytes, 1));
-            },
+            }
             _ => panic!("Expected Trie node"),
         }
     }
@@ -968,19 +1125,19 @@ mod tests {
     fn test_convert_to_btree() {
         // Explicitly specify type parameters
         let mut trie: TrieNode<String, i32> = create_test_trie_node(Some(1), 0);
-        
+
         // Add some children
         let child: TrieNode<String, i32> = create_test_trie_node(Some(2), 1);
         trie.children[97] = Some(Arc::new(RwLock::new(NodeType::Trie(child))));
 
         let result: NodeType<String, i32> = utils::convert_to_btree(&trie);
-        
+
         match result {
             NodeType::BTree(btree) => {
                 assert!(btree.is_leaf);
                 assert_eq!(btree.keys.len(), 2);
                 assert_eq!(btree.values.len(), 2);
-            },
+            }
             _ => panic!("Expected BTree node"),
         }
     }
@@ -988,11 +1145,8 @@ mod tests {
     #[test]
     fn test_btree_node_operations() {
         // Test with explicit types for B+ tree nodes
-        let btree: BTreeNode<String, i32> = create_test_btree_node(
-            vec!["a".to_string(), "b".to_string()],
-            vec![1, 2],
-            true
-        );
+        let btree: BTreeNode<String, i32> =
+            create_test_btree_node(vec!["a".to_string(), "b".to_string()], vec![1, 2], true);
 
         assert_eq!(btree.keys.len(), 2);
         assert_eq!(btree.values.len(), 2);
@@ -1001,7 +1155,7 @@ mod tests {
 
     #[test]
     fn test_string_key_conversion() {
-        let key = String::from("hello");
+        let key: String = String::from("hello");
         assert_eq!(key.to_bytes(), b"hello");
     }
 
@@ -1016,7 +1170,7 @@ mod tests {
 
     #[test]
     fn test_bytes_key_conversion() {
-        let key = vec![1, 2, 3, 4];
+        let key: Vec<u8> = vec![1, 2, 3, 4];
         assert_eq!(key.to_bytes(), vec![1, 2, 3, 4]);
     }
 }
