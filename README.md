@@ -107,6 +107,56 @@ range(start_key, end_key):
      → Scan leaf nodes using links
 ```
 
+**4. Range Query**
+
+```
+update(key, new_value):
+1. Start at root node
+2. For each node encountered:
+   If Trie Node:
+     → If depth equals key length:
+        - Replace value and return old value
+        - Return None if no value exists
+     → Otherwise navigate using key bytes
+   
+   If B+ Tree Node:
+     → If leaf node:
+        - Find key using binary search
+        - Replace value if found and return old value
+        - Return None if key not found
+     → If internal node:
+        - Navigate to appropriate child using binary search
+3. Return None if path ends without finding key
+```
+
+**5. Range Query**
+
+```
+delete(key):
+1. Start at root node and track path
+2. For each node encountered:
+   If Trie Node:
+     → If depth equals key length:
+        - Remove value and return it
+        - Clean up empty nodes in path
+     → Otherwise navigate using key bytes
+   
+   If B+ Tree Node:
+     → If leaf node:
+        - Remove key-value pair if found
+        - If node becomes too sparse:
+          * Try borrowing from siblings
+          * Merge with sibling if borrowing not possible
+          * Convert to trie if occupancy too low
+     → If internal node:
+        - Navigate to appropriate child
+        - After deletion, rebalance if necessary:
+          * Redistribute keys among siblings
+          * Merge nodes if too sparse
+3. Update size counters
+4. Return removed value or None if key not found
+```
+
 ### Adaptive Mechanisms
 
 **1. Trie → B+ Tree Conversion**

@@ -12,3 +12,9 @@ keywords = ["data-structures", "adaptive", "segmented", "trie"]
 categories = ["data-structures"]
 
 [dependencies]
+criterion = "0.5.1"
+rand = "0.8.0"
+
+[[bench]]
+name = "benchmark"
+harness = false

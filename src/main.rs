@@ -32,7 +32,7 @@ impl FromBytes for UserProfile {
 fn main() {
     // Example 1: Basic String key usage
     println!("\n=== Example 1: Basic String Keys ===");
-    let string_trie = ASTrie::<String, i32>::new();
+    let string_trie: ASTrie<String, i32> = ASTrie::<String, i32>::new();
     
     // Insert operations
     let start: Instant = Instant::now();
@@ -112,7 +112,7 @@ fn main() {
     // Range query with pagination
     let page_size: usize = 10;
     println!("First {} items in range 100-200:", page_size);
-    let range = numeric_trie.range(&100, &200);
+    let range: Vec<(i32, String)> = numeric_trie.range(&100, &200);
     for (key, value) in range.iter().take(page_size) {
         println!("  {} -> {}", key, value);
     }
